@@ -2,7 +2,9 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 import json
+import sys
 import unittest
+from unittest.mock import patch
 
 from optuna.study import StudyDirection
 from optuna.trial import create_trial
@@ -42,7 +44,8 @@ def make_settings(**overrides) -> Settings:
         ],
     }
     data.update(overrides)
-    return Settings.model_validate(data)
+    with patch.object(sys, "argv", [sys.argv[0]]):
+        return Settings.model_validate(data)
 
 
 def make_score_records() -> list[dict[str, object]]:
@@ -132,7 +135,9 @@ class TrialFormattingTests(unittest.TestCase):
 
 
 class ReproductionTests(unittest.TestCase):
-    def test_missing_ara_flags_in_legacy_reproduction_default_to_directional(self) -> None:
+    def test_missing_ara_flags_in_legacy_reproduction_default_to_directional(
+        self,
+    ) -> None:
         reproduction_information = {
             "settings": {
                 "model": "dummy/model",

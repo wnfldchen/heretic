@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import sys
 import unittest
+from unittest.mock import patch
 
 from heretic.config import Settings
 from heretic.evaluator import BUILTIN_KL_PLUGIN, BUILTIN_PIQA_PLUGIN, Evaluator
@@ -32,7 +34,8 @@ def make_settings(**overrides) -> Settings:
         ],
     }
     data.update(overrides)
-    return Settings.model_validate(data)
+    with patch.object(sys, "argv", [sys.argv[0]]):
+        return Settings.model_validate(data)
 
 
 class EvaluatorCompatibilityTests(unittest.TestCase):

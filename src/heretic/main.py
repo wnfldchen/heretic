@@ -69,11 +69,11 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import ExportStrategy, QuantizationMethod, RowNormalization, Settings
+from .config import ExportStrategy, QuantizationMethod, RowNormalization
 from .evaluator import Evaluator
 from .model import (
-    ARAParameters,
     AbliterationParameters,
+    ARAParameters,
     Model,
     ModuleIO,
     get_model_class,
@@ -739,10 +739,22 @@ def run():
                 # The parameter ranges are based on experiments with various models
                 # and much wider ranges. They are not set in stone and might have to be
                 # adjusted for future models.
-                max_weight = trial.suggest_float(
-                    f"{component}.max_weight",
-                    0.8,
-                    1.5,
+                #
+                # The MLP gets a negative lower bound that is then clamped to 0, so the
+                # optimizer can fully disable its ablation. The clamp puts a positive
+                # probability mass on exactly 0 (the continuous sampler would otherwise
+                # reach 0 with probability zero). Ablating the MLP is often unnecessary for
+                # removing refusals and tends to damage model intelligence more than
+                # ablating the attention output, so on many models the optimum is to leave
+                # it (mostly) untouched. See issue #202.
+                max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
+                max_weight = max(
+                    0.0,
+                    trial.suggest_float(
+                        f"{component}.max_weight",
+                        max_weight_lower_bound,
+                        1.5,
+                    ),
                 )
                 max_weight_position = trial.suggest_float(
                     f"{component}.max_weight_position",
@@ -760,7 +772,7 @@ def run():
                 min_weight_distance = trial.suggest_float(
                     f"{component}.min_weight_distance",
                     1.0,
-                    0.6 * last_layer_index,
+                    max(0.6 * last_layer_index, 1.0),
                 )
 
                 parameters[component] = AbliterationParameters(
@@ -1355,14 +1367,11 @@ def run():
                                     and "reproducible" not in card.data.tags
                                 ):
                                     card.data.tags.append("reproducible")
-                                card.text = (
-                                    get_readme_intro(
-                                        settings,
-                                        trial,
-                                        reproducibility_information != "none",
-                                    )
-                                    + (card.text or "")
-                                )
+                                card.text = get_readme_intro(
+                                    settings,
+                                    trial,
+                                    reproducibility_information != "none",
+                                ) + (card.text or "")
                                 card.push_to_hub(repo_id, token=token)
 
                             if reproducibility_information != "none":

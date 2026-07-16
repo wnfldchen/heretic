@@ -15,7 +15,6 @@ from peft.tuners.lora.layer import Linear
 from torch import FloatTensor, LongTensor, Tensor
 from torch.nn import Module, ModuleList
 from torch.optim import LBFGS
-from torch.utils.hooks import RemovableHandle
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
@@ -737,8 +736,8 @@ class Model:
                         return loss
 
                     # Convergence usually happens within 2-3 steps, so this is more than enough.
-                    for step in range(5):
-                        loss = optimizer.step(closure)
+                    for _ in range(5):
+                        optimizer.step(closure)
                         # print(
                         #    f"\\[{layer_index}/{component}/{module_index}] Step: {step}, Loss: {loss.item():.6f}"
                         # )
@@ -772,9 +771,8 @@ class Model:
                         # Maintain the original dequantization logic for bitsandbytes.
                         W_base = cast(
                             Tensor,
-                            bnb.functional.dequantize_4bit(
-                                base_weight.data, 
-                                quant_state
+                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+                                base_weight.data, quant_state
                             ).to(torch.float32),
                         )
 
@@ -790,8 +788,12 @@ class Model:
 
                     # Data preparation.
                     # Move I/O tensors to the device of the adapter weights.
-                    good_input, good_output = good_module_io[layer_index][component][module_index]
-                    bad_input, bad_output = bad_module_io[layer_index][component][module_index]
+                    good_input, good_output = good_module_io[layer_index][component][
+                        module_index
+                    ]
+                    bad_input, bad_output = bad_module_io[layer_index][component][
+                        module_index
+                    ]
 
                     good_input = good_input.float().to(lora_A.device)
                     good_output = good_output.float().to(lora_A.device)
@@ -1060,7 +1062,7 @@ class Model:
 
             return hook
 
-        hook_handles: list[RemovableHandle] = []
+        hook_handles: list[Any] = []
 
         for layer_index in range(len(self.get_layers())):
             for component, modules in self.get_layer_modules(layer_index).items():
