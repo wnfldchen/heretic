@@ -69,7 +69,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import ExportStrategy, QuantizationMethod, RowNormalization
+from .config import ExportStrategy, QuantizationMethod
 from .evaluator import Evaluator
 from .model import (
     AbliterationParameters,
@@ -89,6 +89,7 @@ from .utils import (
     ask_if_unset,
     format_duration,
     format_exception,
+    generate_evaluation_section,
     get_file_sha256,
     get_readme_intro,
     get_settings_from_reproduction,
@@ -99,8 +100,61 @@ from .utils import (
     load_prompts,
     print,
     print_memory_usage,
+    update_model_card_data,
     upload_reproduce_folder,
 )
+
+
+def explain_runtime_setting_adjustments(settings: Settings) -> None:
+    if not settings._auto_enabled_use_ara_lora:
+        return
+
+    print()
+    print(
+        "[yellow]Full-weight ARA is not compatible with bitsandbytes 4-bit quantization.[/]"
+    )
+    print("Using [bold]LoRA-backed ARA[/] automatically for this run.")
+
+
+def enqueue_seeded_ara_trials(study: optuna.Study, settings: Settings) -> None:
+    if not settings.use_ara or not settings.seed_ara_trials:
+        return
+
+    existing_fixed_params = []
+    for trial in study.trials:
+        if trial.params:
+            existing_fixed_params.append(trial.params)
+
+        fixed_params = trial.system_attrs.get("fixed_params")
+        if fixed_params:
+            existing_fixed_params.append(fixed_params)
+
+    enqueued_count = 0
+    skipped_count = 0
+    for seeded_trial in settings.seed_ara_trials:
+        params = seeded_trial.model_dump()
+        if params in existing_fixed_params:
+            skipped_count += 1
+            continue
+
+        study.enqueue_trial(params)
+        existing_fixed_params.append(params)
+        enqueued_count += 1
+
+    if not enqueued_count and not skipped_count:
+        return
+
+    print()
+    if enqueued_count:
+        print(
+            f"* Enqueued [bold]{enqueued_count}[/] seeded ARA "
+            f"trial{'s' if enqueued_count != 1 else ''}"
+        )
+    if skipped_count:
+        print(
+            f"* Skipped [bold]{skipped_count}[/] duplicate seeded ARA "
+            f"trial{'s' if skipped_count != 1 else ''}"
+        )
 
 
 def obtain_export_strategy(
@@ -422,6 +476,8 @@ def run():
             os.unlink(study_checkpoint_file)
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
             storage = JournalStorage(backend)
+
+    explain_runtime_setting_adjustments(settings)
 
     model = Model(settings)
     print()
@@ -856,6 +912,7 @@ def run():
             print("Resuming existing study.")
 
         try:
+            enqueue_seeded_ara_trials(study, settings)
             study.optimize(
                 objective_wrapper,
                 n_trials=settings.n_trials - len(study.trials),
@@ -1003,6 +1060,7 @@ def run():
                     study.set_user_attr("finished", False)
 
                     try:
+                        enqueue_seeded_ara_trials(study, settings)
                         study.optimize(
                             objective_wrapper,
                             n_trials=settings.n_trials - len(study.trials),
@@ -1026,6 +1084,7 @@ def run():
             apply_selected_trial(trial)
 
             action_loop_active = True
+            benchmark_runs_by_name: dict[str, dict[str, Any]] = {}
 
             while action_loop_active:
                 # Ensure a predefined action is only executed once.
@@ -1342,35 +1401,19 @@ def run():
                             if card is not None:
                                 if card.data is None:
                                     card.data = ModelCardData()
-                                if card.data.tags is None:
-                                    card.data.tags = []
-                                for tag in [
-                                    "heretic",
-                                    "uncensored",
-                                    "decensored",
-                                    "abliterated",
-                                ]:
-                                    if tag not in card.data.tags:
-                                        card.data.tags.append(tag)
-                                if settings.use_ara:
-                                    if "ara" not in card.data.tags:
-                                        card.data.tags.append("ara")
-                                elif (
-                                    settings.orthogonalize_direction
-                                    and settings.row_normalization
-                                    == RowNormalization.FULL
-                                    and "mpoa" not in card.data.tags
-                                ):
-                                    card.data.tags.append("mpoa")
-                                if (
-                                    reproducibility_information != "none"
-                                    and "reproducible" not in card.data.tags
-                                ):
-                                    card.data.tags.append("reproducible")
+                                update_model_card_data(
+                                    card.data,
+                                    settings,
+                                    reproducibility_information != "none",
+                                )
                                 card.text = get_readme_intro(
                                     settings,
                                     trial,
                                     reproducibility_information != "none",
+                                    evaluation_section=generate_evaluation_section(
+                                        list(benchmark_runs_by_name.values())
+                                    ),
+                                    includes_upstream_model_card=bool(card.text),
                                 ) + (card.text or "")
                                 card.push_to_hub(repo_id, token=token)
 
@@ -1547,6 +1590,14 @@ def run():
                                         else:
                                             with model.model.disable_adapter():  # ty:ignore[call-non-callable]
                                                 original_results = get_results()
+                                    else:
+                                        original_results = None
+
+                                    benchmark_runs_by_name[benchmark.name] = {
+                                        "benchmark": benchmark.name,
+                                        "results": results,
+                                        "original_results": original_results,
+                                    }
 
                                     first_row = True
 

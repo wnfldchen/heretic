@@ -2,14 +2,16 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 from enum import Enum
-from typing import Dict, Literal
+from typing import Any, Dict, Literal
 
 from pydantic import (
     BaseModel,
     Field,
     NonNegativeInt,
     PositiveInt,
+    PrivateAttr,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import (
     BaseSettings,
@@ -154,7 +156,50 @@ class BenchmarkSpecification(BaseModel):
     )
 
 
+class SeededARATrial(BaseModel):
+    start_layer_index: NonNegativeInt = Field(
+        description="First layer index (inclusive) to optimize during ARA."
+    )
+
+    end_layer_index: NonNegativeInt = Field(
+        description="Last layer index (exclusive) to optimize during ARA."
+    )
+
+    preserve_good_behavior_weight: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Weight of the objective term that keeps harmless behavior close to baseline.",
+    )
+
+    steer_bad_behavior_weight: float = Field(
+        gt=0.0,
+        le=1.0,
+        description="Weight of the objective term that steers harmful behavior away from refusal patterns.",
+    )
+
+    overcorrect_relative_weight: float = Field(
+        ge=0.0,
+        le=1.3,
+        description="Extra relative push away from the original bad activations.",
+    )
+
+    neighbor_count: int = Field(
+        ge=1,
+        le=15,
+        description="Number of neighbors used in the ARA KNN objective.",
+    )
+
+    @model_validator(mode="after")
+    def validate_layer_range(self) -> "SeededARATrial":
+        if self.end_layer_index <= self.start_layer_index:
+            raise ValueError("end_layer_index must be greater than start_layer_index")
+
+        return self
+
+
 class Settings(BaseSettings):
+    _auto_enabled_use_ara_lora: bool = PrivateAttr(default=False)
+
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
     model_commit: str | None = Field(
@@ -371,7 +416,8 @@ class Settings(BaseSettings):
     use_ara_lora: bool = Field(
         default=False,
         description=(
-            "Use LoRA in ARA instead of full-weight editing. Makes it compatible with quantization and removes model reloads."
+            "Use LoRA in ARA instead of full-weight editing. Makes it compatible with quantization and removes model reloads. "
+            "Quantized ARA runs enable this automatically."
         ),
     )
 
@@ -426,6 +472,25 @@ class Settings(BaseSettings):
             "of the components, then clamps the magnitudes of all components to that quantile."
         ),
     )
+
+    seed_ara_trials: list[SeededARATrial] = Field(
+        default_factory=list,
+        description=(
+            "Optional list of hand-picked ARA parameter sets to enqueue before Optuna starts sampling. "
+            "Useful for warming up a run with promising public solutions or previous good trials."
+        ),
+    )
+
+    def model_post_init(self, __context: Any) -> None:
+        self._auto_enabled_use_ara_lora = False
+
+        if (
+            self.use_ara
+            and self.quantization == QuantizationMethod.BNB_4BIT
+            and not self.use_ara_lora
+        ):
+            self.use_ara_lora = True
+            self._auto_enabled_use_ara_lora = True
 
     n_trials: PositiveInt = Field(
         default=200,

@@ -100,6 +100,8 @@ scorers = [
 use_ara = true
 
 # Whether to use LoRA-backed ARA instead of full-weight ARA.
+# Quantized (`bnb_4bit`) ARA runs enable this automatically because
+# full-weight ARA cannot operate directly on 4-bit weights.
 use_ara_lora = false
 
 # The LoRA rank to use when `use_ara_lora = true`.
@@ -130,6 +132,12 @@ full_normalization_lora_rank = 3
 # Example: winsorization_quantile = 0.95 computes the 0.95-quantile of the absolute values
 # of the components, then clamps the magnitudes of all components to that quantile.
 winsorization_quantile = 1.0
+
+# Optional hand-picked ARA parameter sets to enqueue before Optuna sampling.
+# Useful for warming up a run with good public solutions or previous good trials.
+# seed_ara_trials = [
+#     { start_layer_index = 9, end_layer_index = 36, preserve_good_behavior_weight = 0.4826, steer_bad_behavior_weight = 0.0002, overcorrect_relative_weight = 1.0491, neighbor_count = 15 },
+# ]
 
 # Number of abliteration trials to run during optimization.
 n_trials = 200

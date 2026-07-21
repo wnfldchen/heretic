@@ -20,6 +20,7 @@ from datasets import DatasetDict, ReadInstruction, load_dataset, load_from_disk
 from datasets.config import DATASET_STATE_JSON_FILENAME
 from datasets.download.download_manager import DownloadMode
 from datasets.utils.info_utils import VerificationMode
+from huggingface_hub import ModelCardData
 from huggingface_hub.utils import validate_repo_id
 from optuna import Trial
 from optuna.study import StudyDirection
@@ -377,10 +378,285 @@ def get_method_description(settings: Settings) -> str:
         return ""
 
 
+def update_model_card_data(
+    card_data: ModelCardData,
+    settings: Settings,
+    contains_reproducibility_information: bool,
+) -> None:
+    if card_data.tags is None:
+        card_data.tags = []
+
+    if card_data.library_name is None:
+        card_data.library_name = "transformers"
+
+    if is_hf_path(settings.model):
+        card_data.base_model = settings.model
+
+    for tag in [
+        "heretic",
+        "uncensored",
+        "decensored",
+        "abliterated",
+        "not-for-all-audiences",
+    ]:
+        if tag not in card_data.tags:
+            card_data.tags.append(tag)
+
+    if settings.use_ara:
+        if "ara" not in card_data.tags:
+            card_data.tags.append("ara")
+    elif (
+        settings.orthogonalize_direction
+        and settings.row_normalization == RowNormalization.FULL
+        and "mpoa" not in card_data.tags
+    ):
+        card_data.tags.append("mpoa")
+
+    if contains_reproducibility_information and "reproducible" not in card_data.tags:
+        card_data.tags.append("reproducible")
+
+
+def get_benchmark_metric_label(metric: str) -> str:
+    name = metric.split(",", 1)[0]
+    match name:
+        case "acc":
+            return "Accuracy"
+        case "acc_norm":
+            return "Normalized accuracy"
+        case "eqbench":
+            return "EQ-Bench score"
+        case "exact_match":
+            return "Exact match"
+        case "percent_parseable":
+            return "Parseable outputs"
+        case _ if name.endswith("_acc"):
+            return (
+                f"{name.removesuffix('_acc').replace('_', ' ').capitalize()} accuracy"
+            )
+        case _:
+            return name.replace("_", " ").capitalize()
+
+
+def get_benchmark_metric_stderr_key(metric: str) -> str:
+    if "," in metric:
+        name, suffix = metric.split(",", 1)
+        return f"{name}_stderr,{suffix}"
+    return f"{metric}_stderr"
+
+
+def is_percentage_metric(metric: str) -> bool:
+    name = metric.split(",", 1)[0]
+    return (
+        name.startswith("acc")
+        or name.endswith("_acc")
+        or name == "exact_match"
+        or name.startswith("percent_")
+    )
+
+
+def format_benchmark_metric_value(
+    metric: str,
+    value: float,
+    *,
+    use_percentage_points: bool = False,
+) -> tuple[str, float]:
+    if is_percentage_metric(metric):
+        scaled_value = value * 100 if abs(value) <= 1 else value
+        suffix = " pp" if use_percentage_points else "%"
+        return f"{scaled_value:.2f}{suffix}", scaled_value
+
+    precision = 2 if abs(value) >= 1 else 4
+    return f"{value:.{precision}f}", value
+
+
+def format_benchmark_metric_delta(
+    metric: str,
+    value: float,
+    baseline: float,
+) -> tuple[str, float]:
+    _, scaled_value = format_benchmark_metric_value(metric, value)
+    _, scaled_baseline = format_benchmark_metric_value(metric, baseline)
+    delta = scaled_value - scaled_baseline
+    if is_percentage_metric(metric):
+        return f"{delta:+.2f} pp", delta
+
+    precision = (
+        2 if max(abs(scaled_value), abs(scaled_baseline), abs(delta)) >= 1 else 4
+    )
+    return f"{delta:+.{precision}f}", delta
+
+
+def generate_evaluation_section(
+    benchmark_runs: list[dict[str, Any]],
+) -> str:
+    if not benchmark_runs:
+        return ""
+
+    rows: list[dict[str, Any]] = []
+    for benchmark_run in benchmark_runs:
+        benchmark = benchmark_run["benchmark"]
+        results = benchmark_run["results"]
+        original_results = benchmark_run.get("original_results")
+        sample_len = int(results.get("sample_len", 0))
+
+        for metric, value in results.items():
+            if metric in {"alias", "name", "sample_len"} or metric.endswith(
+                "_stderr,none"
+            ):
+                continue
+
+            stderr_key = get_benchmark_metric_stderr_key(metric)
+            this_display, _ = format_benchmark_metric_value(metric, float(value))
+            this_stderr = results.get(stderr_key)
+            original_display = None
+            original_stderr = None
+            delta_display = None
+            delta_value = None
+
+            if original_results is not None and metric in original_results:
+                original_value = float(original_results[metric])
+                original_display, _ = format_benchmark_metric_value(
+                    metric, original_value
+                )
+                delta_display, delta_value = format_benchmark_metric_delta(
+                    metric,
+                    float(value),
+                    original_value,
+                )
+                if stderr_key in original_results:
+                    original_stderr, _ = format_benchmark_metric_value(
+                        metric,
+                        float(original_results[stderr_key]),
+                        use_percentage_points=True,
+                    )
+
+            if this_stderr is not None:
+                this_stderr, _ = format_benchmark_metric_value(
+                    metric,
+                    float(this_stderr),
+                    use_percentage_points=True,
+                )
+
+            rows.append(
+                {
+                    "benchmark": benchmark,
+                    "sample_len": sample_len,
+                    "metric_label": get_benchmark_metric_label(metric),
+                    "this_display": this_display,
+                    "original_display": original_display,
+                    "delta_display": delta_display,
+                    "this_stderr": this_stderr,
+                    "original_stderr": original_stderr,
+                    "delta_value": delta_value,
+                }
+            )
+
+    if not rows:
+        return ""
+
+    table_rows = "\n".join(
+        [
+            (
+                f"| {row['benchmark']} | {row['sample_len']} | {row['metric_label']} | "
+                f"{row['this_display']} | {row['original_display'] or ''} | "
+                f"{row['delta_display'] or ''} | {row['this_stderr'] or ''} | "
+                f"{row['original_stderr'] or ''} |"
+            )
+            for row in rows
+        ]
+    )
+
+    compared_rows = [row for row in rows if row["delta_value"] is not None]
+    if compared_rows:
+        lower_rows = [row for row in compared_rows if row["delta_value"] < 0]
+        higher_rows = [row for row in compared_rows if row["delta_value"] > 0]
+        interpretation_lines = []
+
+        if lower_rows and higher_rows:
+            interpretation_lines.append(
+                "Across these benchmarks, the edited model scores lower on "
+                f"{len(lower_rows)} metric(s) and higher on {len(higher_rows)} metric(s) "
+                "relative to the original model."
+            )
+        elif lower_rows:
+            interpretation_lines.append(
+                "Across these benchmarks, the edited model scores lower than the original "
+                f"model on {len(lower_rows)} reported metric(s)."
+            )
+        elif higher_rows:
+            interpretation_lines.append(
+                "Across these benchmarks, the edited model scores higher than the original "
+                f"model on {len(higher_rows)} reported metric(s)."
+            )
+
+        if lower_rows:
+            largest_decline = min(lower_rows, key=lambda row: row["delta_value"])
+            interpretation_lines.append(
+                "The largest decline is "
+                f"`{largest_decline['delta_display']}` on {largest_decline['benchmark']} "
+                f"{str(largest_decline['metric_label']).lower()}."
+            )
+
+        if higher_rows:
+            largest_gain = max(higher_rows, key=lambda row: row["delta_value"])
+            interpretation_lines.append(
+                "The largest improvement is "
+                f"`{largest_gain['delta_display']}` on {largest_gain['benchmark']} "
+                f"{str(largest_gain['metric_label']).lower()}."
+            )
+
+        interpretation_lines.append(
+            "These results should still be interpreted cautiously. Benchmark metrics are "
+            "not all on the same scale, so improvements or regressions are best read "
+            "within each benchmark rather than as a single aggregate score."
+        )
+
+        intro = (
+            "The edited model was compared against the original base model using "
+            "Heretic's integrated `lm_eval` benchmark flow. Results below are "
+            "reported exactly from the benchmark run, with an added delta column "
+            "for quick comparison.\n\n"
+            "Delta = edited model minus original model. Negative values mean the "
+            "edited model scored lower.\n"
+        )
+        interpretation = "\n".join(interpretation_lines)
+    else:
+        intro = (
+            "The edited model was evaluated using Heretic's integrated `lm_eval` "
+            "benchmark flow. Results below are reported exactly from the benchmark run.\n"
+        )
+        interpretation = (
+            "These results reflect this specific benchmark run and evaluation "
+            "configuration; broader capability conclusions should ideally be "
+            "supported with additional benchmarks."
+        )
+
+    return f"""## Evaluation
+
+{intro}
+| Benchmark | Samples | Metric | This model | Original model | Delta | This stderr | Original stderr |
+|---|---:|---|---:|---:|---:|---:|---:|
+{table_rows}
+
+### Interpretation
+
+{interpretation}
+
+### Notes
+
+- Accuracy-style metrics are reported as percentages for readability.
+- Standard errors are shown in the same scale as the corresponding metric;
+  percentage-style metrics use percentage points.
+- These results reflect this specific benchmark run and evaluation configuration; broader capability conclusions should ideally be supported with additional benchmarks.
+"""
+
+
 def get_readme_intro(
     settings: Settings,
     trial: Trial | FrozenTrial,
     contains_reproducibility_information: bool,
+    evaluation_section: str = "",
+    includes_upstream_model_card: bool = False,
 ) -> str:
     if is_hf_path(settings.model):
         model_link = f"[{settings.model}](https://huggingface.co/{settings.model})"
@@ -417,6 +693,16 @@ def get_readme_intro(
     else:
         reproducibility_instructions = ""
 
+    if includes_upstream_model_card:
+        upstream_transition_note = """
+> [!NOTE]
+> The remainder of this README reproduces the upstream model card for the base checkpoint.
+> Any benchmark tables or capability claims below this point refer to the upstream base model,
+> not this Heretic-edited derivative, unless explicitly stated.
+"""
+    else:
+        upstream_transition_note = ""
+
     return f"""# This is a decensored version of {
         model_link
     }, made using [Heretic](https://heretic-project.org) v{version("heretic-llm")}{
@@ -441,6 +727,9 @@ def get_readme_intro(
 | Metric | This model | Original model ({model_link}) |
 | :----- | :--------: | :---------------------------: |
 {score_rows}
+
+{evaluation_section}
+{upstream_transition_note}
 
 -----
 
